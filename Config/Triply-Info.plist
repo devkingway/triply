@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- tripple:// links, used by the widget and the Control Center button -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.kingway.tripple</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>tripple</string>
+			</array>
+		</dict>
+	</array>
+	<!-- Map apps Triply can check for and open directions in -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>comgooglemaps</string>
+		<string>nmap</string>
+		<string>iosamap</string>
+	</array>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Triply shows the photos in the iCloud Shared Album you link to a trip.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Triply uses your location to show how long it takes to reach your next stop.</string>
+</dict>
+</plist>
