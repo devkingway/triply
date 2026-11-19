@@ -165,6 +165,121 @@ struct ExpenseFormView: View {
     private var itemsDiscount: Double { lineItems.reduce(0) { $0 + $1.discountInBill(currency: currency, rate: rate) } }
 
 
+    /// Split the bill, bought for someone else, discount and tax refund (shown on the Additional features page).
+    @ViewBuilder private var additionalFeatureSections: some View {
+        if !isLinked {
+            Section {
+                Toggle(isOn: Binding(
+                    get: { splitOn },
+                    set: { on in
+                        withAnimation { splitOn = on }
+                        // Off: back to just you paying the whole bill.
+                        if !on {
+                            sharedBy = 1
+                            paidPortions = 1
+                            splitMode = .people
+                            shareValue = nil
+                        } else if sharedBy == 1 && splitMode == .people {
+                            sharedBy = 2
+                        }
+                    }
+                )) {
+                    Label("Split the bill", systemImage: "person.3.fill")
+                }
+                .tint(Theme.teal)
+                if splitOn {
+                    Picker("Split by", selection: $splitMode.animation()) {
+                        ForEach(SplitMode.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowSeparator(.hidden)
+
+                    switch splitMode {
+                    case .people:
+                        Stepper(value: $sharedBy, in: 1...30) {
+                            LabeledContent("People sharing", value: sharedBy == 1 ? "Just me" : "\(sharedBy) people")
+                        }
+                        if sharedBy > 1 {
+                            Picker("I pay for", selection: $paidPortions) {
+                                ForEach(0...sharedBy, id: \.self) { n in
+                                    Text(n == 0 ? "Nothing (0)" : n == 1 ? "Just me (1)" : n == sharedBy ? "Everyone (\(n))" : "\(n) people").tag(n)
+                                }
+                            }
+                        }
+                    case .percent:
+                        HStack {
+                            Text("My share")
+                            Spacer()
+                            TextField("40", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
+                                .keyboardType(.decimalPad)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 100)
+                            Text("%").foregroundStyle(.secondary)
+                        }
+                    case .amount:
+                        HStack {
+                            Text("My share")
+                            Spacer()
+                            Text(currency).foregroundStyle(.secondary)
+                            TextField("0", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
+                                .keyboardType(.decimalPad)
+                                .multilineTextAlignment(.trailing)
+                                .frame(maxWidth: 120)
+                        }
+                    }
+                }
+            } footer: {
+                if splitOn {
+                    splitFooter
+                } else {
+                    Text("Sharing a meal or a taxi? Turn on to split it by people, percent or exact amount.")
+                }
+            }
+        }
+
+        Section {
+            Toggle(isOn: $forSomeoneElse.animation()) {
+                Label("Bought for someone else", systemImage: "person.2.fill")
+            }
+            .tint(.orange)
+            if forSomeoneElse {
+                TextField("Who is it for? (e.g. Ali)", text: $friendName)
+                    .textInputAutocapitalization(.words)
+            }
+        } header: {
+            Text("Who is it for?")
+        } footer: {
+            if forSomeoneElse {
+                Text(isRepaid
+                     ? "Paid back, so it's no longer counted in your spending."
+                     : "Counted in your spending until they pay you back. Then switch on Paid me back on the expense.")
+                    .foregroundStyle(isRepaid ? .green : .orange)
+            } else {
+                Text("Turn on if you paid for a friend's item. It counts until they pay you back.")
+            }
+        }
+
+        discountSection
+
+        taxRefundSection
+    }
+
+    /// The additional features switched on for this expense, e.g. ["Split", "Discount"].
+    private var activeFeatures: [String] {
+        var list: [String] = []
+        if !isLinked && splitOn { list.append(isSplitting ? "Split · your \(myShareMYR.myr)" : "Split") }
+        if forSomeoneElse { list.append(friendName.trimmingCharacters(in: .whitespaces).isEmpty ? "For someone else" : "For \(friendName.trimmingCharacters(in: .whitespaces))") }
+        if giveDiscount { list.append("Discount") }
+        if claimTax { list.append("Tax refund") }
+        return list
+    }
+
+    private var additionalFeaturesSummary: String {
+        guard activeFeatures.isEmpty else { return activeFeatures.joined(separator: " · ") }
+        return isLinked ? "Bought for someone else, discount, tax refund"
+                        : "Split the bill, bought for someone else, discount, tax refund"
+    }
+
     /// Tax refund: a % or amount, or copied from the items' tax deductions.
     private var taxRefundSection: some View {
             Section {
@@ -523,103 +638,49 @@ struct ExpenseFormView: View {
 
                 itemsSection
 
-                if !isLinked {
-                    Section {
-                        Toggle(isOn: Binding(
-                            get: { splitOn },
-                            set: { on in
-                                withAnimation { splitOn = on }
-                                // Off: back to just you paying the whole bill.
-                                if !on {
-                                    sharedBy = 1
-                                    paidPortions = 1
-                                    splitMode = .people
-                                    shareValue = nil
-                                } else if sharedBy == 1 && splitMode == .people {
-                                    sharedBy = 2
-                                }
-                            }
-                        )) {
-                            Label("Split the bill", systemImage: "person.3.fill")
-                        }
-                        .tint(Theme.teal)
-                        if splitOn {
-                            Picker("Split by", selection: $splitMode.animation()) {
-                                ForEach(SplitMode.allCases) { Text($0.label).tag($0) }
-                            }
-                            .pickerStyle(.segmented)
-                            .listRowSeparator(.hidden)
-
-                            switch splitMode {
-                            case .people:
-                                Stepper(value: $sharedBy, in: 1...30) {
-                                    LabeledContent("People sharing", value: sharedBy == 1 ? "Just me" : "\(sharedBy) people")
-                                }
-                                if sharedBy > 1 {
-                                    Picker("I pay for", selection: $paidPortions) {
-                                        ForEach(0...sharedBy, id: \.self) { n in
-                                            Text(n == 0 ? "Nothing (0)" : n == 1 ? "Just me (1)" : n == sharedBy ? "Everyone (\(n))" : "\(n) people").tag(n)
-                                        }
-                                    }
-                                }
-                            case .percent:
-                                HStack {
-                                    Text("My share")
-                                    Spacer()
-                                    TextField("40", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
-                                        .keyboardType(.decimalPad)
-                                        .multilineTextAlignment(.trailing)
-                                        .frame(maxWidth: 100)
-                                    Text("%").foregroundStyle(.secondary)
-                                }
-                            case .amount:
-                                HStack {
-                                    Text("My share")
-                                    Spacer()
-                                    Text(currency).foregroundStyle(.secondary)
-                                    TextField("0", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
-                                        .keyboardType(.decimalPad)
-                                        .multilineTextAlignment(.trailing)
-                                        .frame(maxWidth: 120)
-                                }
-                            }
-                        }
-                    } footer: {
-                        if splitOn {
-                            splitFooter
-                        } else {
-                            Text("Sharing a meal or a taxi? Turn on to split it by people, percent or exact amount.")
-                        }
-                    }
-                }
-
+                // Split the bill, bought for someone else, discount and tax refund, on their own page.
                 Section {
-                    Toggle(isOn: $forSomeoneElse.animation()) {
-                        Label("Bought for someone else", systemImage: "person.2.fill")
+                    NavigationLink {
+                        Form { additionalFeatureSections }
+                            .navigationTitle("Additional features")
+                            .navigationBarTitleDisplayMode(.inline)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.app(.subheadline, .semibold))
+                                .foregroundStyle(.white)
+                                .frame(width: 32, height: 32)
+                                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Theme.teal.gradient))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Additional features")
+                                Text(additionalFeaturesSummary)
+                                    .font(.app(.caption))
+                                    .foregroundStyle(activeFeatures.isEmpty ? Color.secondary : Theme.teal)
+                                    .lineLimit(2)
+                            }
+                        }
                     }
-                    .tint(.orange)
+                    // Bought for someone else: tick it off here when they pay you back.
                     if forSomeoneElse {
-                        TextField("Who is it for? (e.g. Ali)", text: $friendName)
-                            .textInputAutocapitalization(.words)
-                        Toggle("Paid me back", isOn: $isRepaid)
-                            .tint(.green)
+                        Toggle(isOn: $isRepaid.animation()) {
+                            Label {
+                                let who = friendName.trimmingCharacters(in: .whitespaces)
+                                Text(who.isEmpty ? "Paid me back" : "\(who) paid me back")
+                            } icon: {
+                                Image(systemName: isRepaid ? "checkmark.circle.fill" : "person.crop.circle.badge.clock")
+                                    .foregroundStyle(isRepaid ? Color.green : Color.orange)
+                            }
+                        }
+                        .tint(.green)
                     }
-                } header: {
-                    Text("Who is it for?")
                 } footer: {
                     if forSomeoneElse {
                         Text(isRepaid
                              ? "Paid back, so it's no longer counted in your spending."
-                             : "Counted in your spending until they pay you back. Then switch on Paid me back.")
+                             : "Counted in your spending until they pay you back.")
                             .foregroundStyle(isRepaid ? .green : .orange)
-                    } else {
-                        Text("Turn on if you paid for a friend's item. It counts until they pay you back.")
                     }
                 }
-
-                discountSection
-
-                taxRefundSection
 
                 if let hotel = target?.hotel {
                     Section {
