@@ -1105,6 +1105,42 @@ struct ExpenseLineItem: Codable, Identifiable, Hashable {
         set { formulaRaw = newValue.rawValue }
     }
 
+    // Tax charged on the item, as printed on the receipt. Recorded only: it never changes the item total,
+    // the expense or the budget. (All optional so older saved items read as "no tax".)
+    var chargedTaxKindRaw: String? = nil
+    /// The rate (%) or, when `chargedTaxIsPercent` is false, the tax on one item.
+    var chargedTax: Double? = nil
+    var chargedTaxIsPercent: Bool? = nil
+    /// `true` (default) = the price already includes the tax; `false` = tax is added on top.
+    var chargedTaxIncluded: Bool? = nil
+
+    var chargedTaxKind: ItemTaxKind {
+        get { chargedTaxKindRaw.flatMap(ItemTaxKind.init(rawValue:)) ?? .none }
+        set { chargedTaxKindRaw = newValue == .none ? nil : newValue.rawValue }
+    }
+
+    /// Tax charged on all of them (after discount), in the item's currency.
+    var chargedTaxValue: Double {
+        guard chargedTaxKind.isCharged, let value = chargedTax, value > 0 else { return 0 }
+        if chargedTaxIsPercent == false { return value * Double(count) }
+        let base = subtotal - discountValue
+        guard base > 0 else { return 0 }
+        return chargedTaxIncluded == false ? base * value / 100 : base * value / (100 + value)
+    }
+
+    /// e.g. "10%" or "¥100 each"; `nil` when no tax is charged.
+    func chargedTaxRateText(bill: String) -> String? {
+        guard chargedTaxKind.isCharged, let value = chargedTax, value > 0 else { return nil }
+        return chargedTaxIsPercent == false
+            ? "\(value.money(currencyCode(bill: bill))) each"
+            : "\(value.formatted(.number.precision(.fractionLength(0...2))))%"
+    }
+
+    /// The tax charged converted into the bill's currency (for the receipt's tax summary).
+    func chargedTaxInBill(currency bill: String, rate billRate: Double) -> Double {
+        inBill(chargedTaxValue, currency: bill, rate: billRate)
+    }
+
     var count: Int { max(quantity ?? 1, 1) }
     /// Price × quantity.
     var subtotal: Double { amount * Double(count) }
@@ -1170,6 +1206,52 @@ struct ExpenseLineItem: Codable, Identifiable, Hashable {
         let code = currencyCode(bill: bill)
         guard code != bill, let rate = rateToMYR, rate > 0, billRate > 0 else { return value }
         return value * rate / billRate
+    }
+}
+
+/// How an item on a receipt is taxed (e.g. Japan: 10% standard, 8% reduced for food).
+enum ItemTaxKind: String, CaseIterable, Identifiable {
+    case none, standard, reduced, taxFree, exempt
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .none: "Not recorded"
+        case .standard: "Standard rate"
+        case .reduced: "Reduced rate"
+        case .taxFree: "Tax-free"
+        case .exempt: "Exempt"
+        }
+    }
+
+    /// Whether a tax amount is charged (and a rate can be entered).
+    var isCharged: Bool { self == .standard || self == .reduced }
+
+    /// The usual rate for this kind in a currency's country, to fill in when it's picked.
+    func usualRate(for currency: String) -> Double? {
+        let rates: (standard: Double, reduced: Double?) = switch currency {
+        case "JPY": (10, 8)
+        case "MYR": (8, 6)
+        case "SGD": (9, nil)
+        case "THB": (7, nil)
+        case "KRW": (10, nil)
+        case "TWD": (5, nil)
+        case "IDR": (12, 11)
+        case "VND": (10, 8)
+        case "CNY": (13, 9)
+        case "AUD": (10, nil)
+        case "NZD": (15, nil)
+        case "EUR": (20, 10)
+        case "GBP": (20, 5)
+        case "CHF": (8.1, 2.6)
+        default: (10, nil)
+        }
+        switch self {
+        case .standard: return rates.standard
+        case .reduced: return rates.reduced
+        default: return nil
+        }
     }
 }
 

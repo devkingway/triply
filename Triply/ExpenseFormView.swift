@@ -54,7 +54,13 @@ struct ExpenseFormView: View {
     @State private var editingItem: ExpenseLineItem?
     /// How every item's discount and tax deduction are worked out (one choice for the whole receipt).
     @State private var itemsFormula: LineItemFormula = .discountFirst
+    /// Tax charged on every item (one choice for the whole receipt). Recorded only.
+    @State private var itemsTaxKind: ItemTaxKind = .none
+    @State private var itemsTaxRate: Double?
+    @State private var itemsTaxIncluded = true
     @State private var shareValue: Double?
+    /// "Split the bill" switch: the split options only show when it's on.
+    @State private var splitOn = false
 
     enum RateStatus { case ready, loading, unavailable }
 
@@ -158,17 +164,6 @@ struct ExpenseFormView: View {
     /// The items' discounts added up in the bill's currency.
     private var itemsDiscount: Double { lineItems.reduce(0) { $0 + $1.discountInBill(currency: currency, rate: rate) } }
 
-    /// The price before discount that makes the bill after discount equal the items' total before tax deduction.
-    private var itemsAmountToPaste: Double {
-        guard giveDiscount else { return itemsBeforeTax }
-        switch discountType {
-        case .items: return itemsBeforeTax + itemsDiscount
-        case .amount: return itemsBeforeTax + max(discountValue ?? 0, 0)
-        case .percent:
-            let off = min(max(discountValue ?? 0, 0), 100) / 100
-            return off < 1 ? itemsBeforeTax / (1 - off) : itemsBeforeTax
-        }
-    }
 
     /// Tax refund: a % or amount, or copied from the items' tax deductions.
     private var taxRefundSection: some View {
@@ -229,14 +224,38 @@ struct ExpenseFormView: View {
     /// Receipt items: each line with its total, and how the items add up against the bill.
     private var itemsSection: some View {
         Section {
-            Picker("Formula", selection: Binding(
-                get: { itemsFormula },
-                set: { newValue in
-                    itemsFormula = newValue
-                    for index in lineItems.indices { lineItems[index].formula = newValue }
+            Picker("Tax type", selection: Binding(
+                get: { itemsTaxKind },
+                set: { kind in
+                    itemsTaxKind = kind
+                    // Fill in the usual rate (e.g. 8% reduced in Japan).
+                    if let usual = kind.usualRate(for: currency) { itemsTaxRate = usual }
+                    applyItemsTax()
                 }
             )) {
-                ForEach(LineItemFormula.allCases) { Text($0.title).tag($0) }
+                ForEach(ItemTaxKind.allCases) { Text($0.label).tag($0) }
+            }
+            if itemsTaxKind.isCharged {
+                HStack {
+                    Text("Tax rate")
+                    Spacer()
+                    TextField("10", value: Binding(
+                        get: { itemsTaxRate },
+                        set: { itemsTaxRate = $0; applyItemsTax() }
+                    ), format: .number.precision(.fractionLength(0...2)))
+                        .keyboardType(.decimalPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 70)
+                    Text("%").foregroundStyle(.secondary)
+                }
+                Picker("Prices", selection: Binding(
+                    get: { itemsTaxIncluded },
+                    set: { itemsTaxIncluded = $0; applyItemsTax() }
+                )) {
+                    Text("Include tax").tag(true)
+                    Text("Tax on top").tag(false)
+                }
+                .pickerStyle(.segmented)
             }
             ForEach(lineItems) { item in
                 Button { editingItem = item } label: {
@@ -248,6 +267,14 @@ struct ExpenseFormView: View {
                                 Text(lineBreakdown(item))
                                     .font(.app(.caption))
                                     .foregroundStyle(.secondary)
+                            }
+                            if let taxLine = chargedTaxLine(item) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "percent")
+                                    Text(taxLine)
+                                }
+                                .font(.app(.caption, .medium))
+                                .foregroundStyle(Theme.teal)
                             }
                         }
                         Spacer()
@@ -262,6 +289,7 @@ struct ExpenseFormView: View {
             Button {
                 var newItem = ExpenseLineItem()
                 newItem.formula = itemsFormula
+                applyItemsTax(to: &newItem)
                 editingItem = newItem
             } label: {
                 Label("Add item", systemImage: "plus.circle.fill")
@@ -270,13 +298,11 @@ struct ExpenseFormView: View {
             Text("Items (optional)")
         } footer: {
             if lineItems.isEmpty {
-                Text("\(itemsFormula.explanation)\n\nAdd each item from the receipt to check it against the bill. For your records only; it doesn't change the amount or budget.")
+                Text("Add each item from the receipt to check it against the bill. For your records only; it doesn't change the amount or budget.")
             } else {
                 let difference = itemsBeforeTax - netAmount
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(itemsFormula.explanation)
-                        .padding(.bottom, 4)
-                    Text("Items \(hasOtherCurrencies ? "≈ " : "")\(itemsBeforeTax.money(currency)) before tax deduction · bill\(discountAmount > 0 ? " after discount" : "") \(netAmount.money(currency))")
+                    Text("Items \(hasOtherCurrencies ? "≈ " : "")\(itemsBeforeTax.money(currency))\(itemsTax > 0 ? " before tax deduction" : "") · bill\(discountAmount > 0 ? " after discount" : "") \(netAmount.money(currency))")
                     // Converted totals can be off by rounding, so allow a little slack then.
                     if abs(difference) < (hasOtherCurrencies ? max(0.01, netAmount * 0.005) : 0.005) {
                         Label("Matches the bill", systemImage: "checkmark.circle.fill")
@@ -285,8 +311,64 @@ struct ExpenseFormView: View {
                         Text("\(abs(difference).money(currency)) \(difference > 0 ? "more" : "less") than the bill")
                             .foregroundStyle(.orange)
                     }
+                    receiptTaxSummary
                 }
             }
+        }
+    }
+
+    /// Sets the receipt's tax type, rate and included/on top on every item.
+    private func applyItemsTax() {
+        for index in lineItems.indices { applyItemsTax(to: &lineItems[index]) }
+    }
+
+    private func applyItemsTax(to item: inout ExpenseLineItem) {
+        item.chargedTaxKind = itemsTaxKind
+        item.chargedTax = itemsTaxKind.isCharged ? itemsTaxRate : nil
+        item.chargedTaxIsPercent = itemsTaxKind.isCharged ? true : nil
+        item.chargedTaxIncluded = itemsTaxKind.isCharged ? itemsTaxIncluded : nil
+    }
+
+    /// e.g. "Reduced 8% · incl. ¥36 tax", "Tax-free".
+    private func chargedTaxLine(_ item: ExpenseLineItem) -> String? {
+        let code = item.currencyCode(bill: currency)
+        switch item.chargedTaxKind {
+        case .none: return nil
+        case .taxFree, .exempt: return item.chargedTaxKind.label
+        case .standard, .reduced:
+            guard let rate = item.chargedTaxRateText(bill: currency) else { return item.chargedTaxKind.label }
+            let kind = item.chargedTaxKind == .reduced ? "Reduced" : "Standard"
+            let how = item.chargedTaxIsPercent == false || item.chargedTaxIncluded != false ? "incl." : "+"
+            return "\(kind) \(rate) · \(how) \(item.chargedTaxValue.money(code)) tax"
+        }
+    }
+
+    /// The tax on the receipt, like the bottom of a real one: tax charged by rate, and the tax deduction.
+    @ViewBuilder private var receiptTaxSummary: some View {
+        let charged = lineItems.filter { $0.chargedTaxValue > 0 }
+        let chargedTotal = charged.reduce(0) { $0 + $1.chargedTaxInBill(currency: currency, rate: rate) }
+        if chargedTotal > 0 || itemsTax > 0 {
+            VStack(alignment: .leading, spacing: 2) {
+                if chargedTotal > 0 {
+                    // Grouped by rate, e.g. "10%: ¥200 · 8%: ¥36".
+                    let groups = Dictionary(grouping: charged) { $0.chargedTaxRateText(bill: currency).map { $0.hasSuffix("%") ? $0 : "Fixed" } ?? "Fixed" }
+                        .map { (label: $0.key, total: $0.value.reduce(0) { $0 + $1.chargedTaxInBill(currency: currency, rate: rate) }) }
+                        .sorted { $0.total > $1.total }
+                    Text("Tax charged \(hasOtherCurrencies ? "≈ " : "")\(chargedTotal.money(currency))")
+                        .fontWeight(.semibold)
+                    if groups.count > 1 || groups.first?.label == "Fixed" {
+                        Text(groups.map { "\($0.label): \($0.total.money(currency))" }.joined(separator: " · "))
+                    } else if let only = groups.first {
+                        Text("All at \(only.label)")
+                    }
+                }
+                if itemsTax > 0 {
+                    Text("Tax deduction \(hasOtherCurrencies ? "≈ " : "")\(itemsTax.money(currency))")
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.green)
+                }
+            }
+            .padding(.top, 6)
         }
     }
 
@@ -354,6 +436,33 @@ struct ExpenseFormView: View {
         NavigationStack {
             Form {
                 Section {
+                    HStack(spacing: 12) {
+                        // Category beside the name: tap the icon to change it.
+                        Menu {
+                            Picker("Category", selection: $category) {
+                                ForEach(selectableCategories) { cat in
+                                    Label(cat.name, systemImage: cat.systemImage).tag(cat)
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: category.systemImage)
+                                    .font(.app(.subheadline))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 34, height: 34)
+                                    .background(Circle().fill(category.color.gradient))
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .simultaneousGesture(TapGesture().onEnded { Haptics.tap() })
+                        .accessibilityLabel("Category: \(category.name)")
+                        Divider().frame(height: 30)
+                        TextField("What was it? (e.g. Ichiran ramen)", text: $title)
+                            .multilineTextAlignment(.trailing)
+                    }
                     HStack {
                         Menu {
                             Picker("Currency", selection: $currency) {
@@ -372,29 +481,27 @@ struct ExpenseFormView: View {
                             .font(.app(.largeTitle, .bold))
                             .multilineTextAlignment(.trailing)
                             .focused($amountFocused)
-                        // Paste the items' total (before tax deduction) into the amount; greyed out without items.
-                        Button {
-                            amount = (itemsAmountToPaste * 100).rounded() / 100
-                            amountFocused = false
-                            Haptics.tap()
-                        } label: {
-                            Image(systemName: "doc.on.clipboard")
-                                .font(.app(.title3))
+                        // Duplicate: opens a copy of this expense; Save adds it as a new one.
+                        // Only for a saved expense of your own (not a hotel, flight or ticket booking).
+                        if let expense = target, expense.linkedHotel == nil, expense.linkedFlight == nil, expense.linkedTicket == nil {
+                            Button {
+                                withAnimation { isCopy = true }
+                                amountFocused = false
+                                Haptics.tap()
+                                Toaster.shared.show("Copy ready · change anything, then Save", systemImage: "plus.square.on.square", style: .info)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                                    .font(.app(.title3))
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Duplicate expense")
                         }
-                        .buttonStyle(.borderless)
-                        .disabled(itemsBeforeTax <= 0)
-                        .accessibilityLabel("Use the items' total")
                     }
                     if currency != "MYR" {
                         rateRow
                     }
                 } footer: {
                     VStack(alignment: .leading, spacing: 4) {
-                        if currency != "MYR", amount != nil {
-                            Text("≈ \(((amount ?? 0) * rate).myr)")
-                                .font(.app(.headline))
-                                .foregroundStyle(.primary)
-                        }
                         // The final amount once a discount or tax back is applied.
                         if amount != nil, discountAmount > 0 || taxBackMYR > 0 {
                             Text("Final\(isSplitting ? " (your share)" : "") \(inBoth(max(myShareMYR - taxBackMYR, 0)))")
@@ -409,86 +516,80 @@ struct ExpenseFormView: View {
                     }
                 }
 
-                Section("Category") {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 12) {
-                        ForEach(selectableCategories) { cat in
-                            Button {
-                                category = cat
-                            } label: {
-                                VStack(spacing: 6) {
-                                    Image(systemName: cat.systemImage)
-                                        .font(.app(.title3))
-                                        .foregroundStyle(category == cat ? .white : cat.color)
-                                        .frame(width: 44, height: 44)
-                                        .background(Circle().fill(category == cat ? AnyShapeStyle(cat.color.gradient) : AnyShapeStyle(cat.color.opacity(0.15))))
-                                    Text(cat.name)
-                                        .font(.app(.caption))
-                                        .foregroundStyle(.primary)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.vertical, 6)
-                    Label("Flights and hotels are added from their own tabs and appear here automatically.",
-                          systemImage: "info.circle")
-                        .font(.app(.caption))
-                        .foregroundStyle(.secondary)
-                }
 
                 Section {
-                    TextField("What was it? (e.g. Ichiran ramen)", text: $title)
                     DatePicker("Date", selection: $date, displayedComponents: [.date, .hourAndMinute])
-                    NotesEditor(placeholder: "Notes", text: $notes)
                 }
 
                 itemsSection
 
                 if !isLinked {
                     Section {
-                        Picker("Split by", selection: $splitMode.animation()) {
-                            ForEach(SplitMode.allCases) { Text($0.label).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                        .listRowSeparator(.hidden)
-
-                        switch splitMode {
-                        case .people:
-                            Stepper(value: $sharedBy, in: 1...30) {
-                                LabeledContent("People sharing", value: sharedBy == 1 ? "Just me" : "\(sharedBy) people")
-                            }
-                            if sharedBy > 1 {
-                                Picker("I pay for", selection: $paidPortions) {
-                                    ForEach(0...sharedBy, id: \.self) { n in
-                                        Text(n == 0 ? "Nothing (0)" : n == 1 ? "Just me (1)" : n == sharedBy ? "Everyone (\(n))" : "\(n) people").tag(n)
-                                    }
+                        Toggle(isOn: Binding(
+                            get: { splitOn },
+                            set: { on in
+                                withAnimation { splitOn = on }
+                                // Off: back to just you paying the whole bill.
+                                if !on {
+                                    sharedBy = 1
+                                    paidPortions = 1
+                                    splitMode = .people
+                                    shareValue = nil
+                                } else if sharedBy == 1 && splitMode == .people {
+                                    sharedBy = 2
                                 }
                             }
-                        case .percent:
-                            HStack {
-                                Text("My share")
-                                Spacer()
-                                TextField("40", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
-                                    .keyboardType(.decimalPad)
-                                    .multilineTextAlignment(.trailing)
-                                    .frame(maxWidth: 100)
-                                Text("%").foregroundStyle(.secondary)
+                        )) {
+                            Label("Split the bill", systemImage: "person.3.fill")
+                        }
+                        .tint(Theme.teal)
+                        if splitOn {
+                            Picker("Split by", selection: $splitMode.animation()) {
+                                ForEach(SplitMode.allCases) { Text($0.label).tag($0) }
                             }
-                        case .amount:
-                            HStack {
-                                Text("My share")
-                                Spacer()
-                                Text(currency).foregroundStyle(.secondary)
-                                TextField("0", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
-                                    .keyboardType(.decimalPad)
-                                    .multilineTextAlignment(.trailing)
-                                    .frame(maxWidth: 120)
+                            .pickerStyle(.segmented)
+                            .listRowSeparator(.hidden)
+
+                            switch splitMode {
+                            case .people:
+                                Stepper(value: $sharedBy, in: 1...30) {
+                                    LabeledContent("People sharing", value: sharedBy == 1 ? "Just me" : "\(sharedBy) people")
+                                }
+                                if sharedBy > 1 {
+                                    Picker("I pay for", selection: $paidPortions) {
+                                        ForEach(0...sharedBy, id: \.self) { n in
+                                            Text(n == 0 ? "Nothing (0)" : n == 1 ? "Just me (1)" : n == sharedBy ? "Everyone (\(n))" : "\(n) people").tag(n)
+                                        }
+                                    }
+                                }
+                            case .percent:
+                                HStack {
+                                    Text("My share")
+                                    Spacer()
+                                    TextField("40", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
+                                        .keyboardType(.decimalPad)
+                                        .multilineTextAlignment(.trailing)
+                                        .frame(maxWidth: 100)
+                                    Text("%").foregroundStyle(.secondary)
+                                }
+                            case .amount:
+                                HStack {
+                                    Text("My share")
+                                    Spacer()
+                                    Text(currency).foregroundStyle(.secondary)
+                                    TextField("0", value: $shareValue, format: .number.precision(.fractionLength(0...2)))
+                                        .keyboardType(.decimalPad)
+                                        .multilineTextAlignment(.trailing)
+                                        .frame(maxWidth: 120)
+                                }
                             }
                         }
-                    } header: {
-                        Text("Split the bill")
                     } footer: {
-                        splitFooter
+                        if splitOn {
+                            splitFooter
+                        } else {
+                            Text("Sharing a meal or a taxi? Turn on to split it by people, percent or exact amount.")
+                        }
                     }
                 }
 
@@ -544,19 +645,6 @@ struct ExpenseFormView: View {
                     }
                 }
 
-                if let expense = target, expense.linkedHotel == nil, expense.linkedFlight == nil, expense.linkedTicket == nil {
-                    Section {
-                        Button {
-                            withAnimation { isCopy = true }
-                            Haptics.tap()
-                        } label: {
-                            Label("Duplicate expense", systemImage: "plus.square.on.square")
-                        }
-                    } footer: {
-                        Text("Makes a new expense with the same details. Change anything (like the date), then Save.")
-                    }
-                }
-
                 if target != nil {
                     Section {
                         Button("Delete expense", role: .destructive) {
@@ -585,6 +673,7 @@ struct ExpenseFormView: View {
                                isNew: !lineItems.contains { $0.id == item.id }) { saved in
                     var saved = saved
                     saved.formula = itemsFormula
+                    applyItemsTax(to: &saved)
                     if let index = lineItems.firstIndex(where: { $0.id == saved.id }) {
                         lineItems[index] = saved
                     } else {
@@ -631,7 +720,8 @@ struct ExpenseFormView: View {
                 .foregroundStyle(.secondary)
             TextField("rate", value: $rate, format: .number.precision(.significantDigits(1...6)))
                 .keyboardType(.decimalPad)
-            Spacer()
+                // As wide as the number, so the refresh button sits right after it.
+                .fixedSize()
             switch rateStatus {
             case .loading:
                 ProgressView()
@@ -646,6 +736,15 @@ struct ExpenseFormView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.borderless)
+            }
+            Spacer(minLength: 8)
+            // The bill converted to RM, on the same row as the rate.
+            if let amount {
+                Text("≈ \((amount * rate).myr)")
+                    .font(.app(.headline))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
         }
         .font(.app(.subheadline))
@@ -673,7 +772,13 @@ struct ExpenseFormView: View {
             splitMode = expense.splitMode
             lineItems = expense.lineItems
             itemsFormula = lineItems.first?.formula ?? .discountFirst
+            if let first = lineItems.first {
+                itemsTaxKind = first.chargedTaxKind
+                itemsTaxRate = first.chargedTax
+                itemsTaxIncluded = first.chargedTaxIncluded ?? true
+            }
             shareValue = expense.myShareValue > 0 ? expense.myShareValue : nil
+            splitOn = expense.sharedBy > 1 || expense.splitMode != .people
             if let type = expense.taxRefundType.flatMap(TaxType.init(rawValue:)), expense.taxRefundValue > 0 {
                 claimTax = true
                 taxType = type
@@ -841,7 +946,10 @@ private struct LineItemEditor: View {
                     amountRow("Price (each)", value: $item.amount)
                     quantityRow
                     adjustmentRow("Discount", value: $item.discount, isPercent: $item.discountIsPercent)
-                    adjustmentRow("Tax deduction", value: $item.tax, isPercent: $item.taxIsPercent)
+                    // Only for items saved with a tax deduction before it was removed, so it can be cleared.
+                    if item.tax != 0 {
+                        adjustmentRow("Tax deduction", value: $item.tax, isPercent: $item.taxIsPercent)
+                    }
                 } footer: {
                     Text("For your records only; it doesn't change the expense amount or budget.")
                 }
@@ -849,17 +957,17 @@ private struct LineItemEditor: View {
                     // The working, then the total, all together.
                     LabeledContent("Subtotal", value: item.subtotal.money(currency))
                     LabeledContent("Total discount", value: "− " + item.discountValue.money(currency))
-                    LabeledContent("Total tax deduction", value: "− " + item.taxValue.money(currency))
+                    if item.taxValue != 0 {
+                        LabeledContent("Total tax deduction", value: "− " + item.taxValue.money(currency))
+                    }
                     LabeledContent("Total price") {
                         Text(item.total.money(currency)).fontWeight(.semibold)
                     }
                 } footer: {
                     if currency != billCurrency, rateMissing {
-                        Text("\(item.formula.title) (change it on the expense): \(item.formula.explanation) Couldn't get the \(currency) rate, so this item can't be checked against the \(billCurrency) bill.")
+                        Text("Couldn't get the \(currency) rate, so this item can't be checked against the \(billCurrency) bill.")
                     } else if currency != billCurrency, let rate = item.rateToMYR {
-                        Text("\(item.formula.title) (change it on the expense): \(item.formula.explanation) 1 \(currency) = RM \(rate.formatted(.number.precision(.significantDigits(1...6)))), used to compare with the \(billCurrency) bill.")
-                    } else {
-                        Text("\(item.formula.title) (change it on the expense): \(item.formula.explanation)")
+                        Text("1 \(currency) = RM \(rate.formatted(.number.precision(.significantDigits(1...6)))), used to compare with the \(billCurrency) bill.")
                     }
                 }
                 if !isNew {
@@ -904,7 +1012,7 @@ private struct LineItemEditor: View {
         }
     }
 
-    /// Quantity laid out like Discount / Tax deduction: − / + in the middle, the number on the right.
+    /// Quantity laid out like Discount: − / + in the middle, the number on the right.
     private var quantityRow: some View {
         HStack {
             Text("Quantity")
